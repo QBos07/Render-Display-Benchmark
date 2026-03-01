@@ -3,3 +3,5 @@ obj/
 .cache/
 .deps/
 compile_commands.json
+out/
+*.zip

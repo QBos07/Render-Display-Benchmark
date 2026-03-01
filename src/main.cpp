@@ -1,22 +1,322 @@
 #include <appdef.h>
-#include <cstddef>
+#include <array>
+#include <cstdint>
 #include <cstdio>
+#include <cinttypes>
+#include <numbers>
 #include <sdk/os/debug.h>
+#include <sdk/os/lcd.h>
+#include <sdk/calc/calc.h>
+#include "power.h"
+#include "tmu.h"
 
-APP_NAME("Your Cool App Name")
-APP_AUTHOR("me")
-APP_DESCRIPTION("A very cool app!")
-APP_VERSION("1.0.0")
+#define MODE_FULL 0
+#define MODE_LINE 1
+#define MODE_PIXEL 2
 
-int main(int argc, char **argv, char **envp) {
-  std::printf("Arguments:\n");
-  for (std::size_t i = 0; i < static_cast<std::size_t>(argc); i++)
-    std::printf(" - %zu: %s\n", i, argv[i]);
+#define MODE MODE_LINE
 
-  std::printf("Environment:\n");
-  for (auto ptr = envp; *ptr != 0; ptr++)
-    std::printf("%s\n", *ptr);
+#define USE_IL
+#define USE_X
+#define USE_Y
+#define USE_DMA
 
-  std::fflush(stdout);
-  Debug_WaitKey();
+
+#if MODE == MODE_FULL
+#define MS "F"
+#elif MODE == MODE_LINE
+#define MS "L"
+#elif MODE == MODE_PIXEL
+#define MS "P"
+#endif
+
+#ifdef USE_DMA
+#include "dmac.h"
+#define DMAS "-DMA"
+#else
+#define DMAS
+#endif
+
+#if MODE != MODE_LINE && defined(USE_Y)
+#error "USE_Y needs MODE_LINE"
+#endif
+#if MODE == MODE_PIXEL && defined(USE_DMA)
+#error "USE_DMA doesnt work with MODE_PIXEL"
+#endif
+
+#define TO_STRING(x) #x
+#define TO_STRING2(x) TO_STRING(x)
+
+#ifdef USE_IL
+#define IL_ATTR [[gnu::section(".oc_mem.il." TO_STRING2(__COUNTER__))]]
+#define ILS "-IL"
+#else
+#define IL_ATTR
+#define ILS
+#endif
+
+#ifdef USE_X
+extern "C" void on_alt_stack(void *, void (*)());
+#define XS "-X"
+#else
+#define on_alt_stack(s, f) f()
+#define XS
+#endif
+
+#ifdef USE_Y
+#define YS "-Y"
+#else
+#define YS
+#endif
+
+APP_NAME("Bencher " MS ILS XS YS DMAS)
+APP_AUTHOR("QBos07")
+APP_DESCRIPTION("Benchmarks various display and rendering aspects")
+APP_VERSION("1.0.0 " __TIMESTAMP__)
+
+constexpr std::array<uint8_t, 256> make_sin_lut()
+{
+    std::array<uint8_t, 256> lut{};
+
+    for (int i = 0; i < 256; ++i)
+    {
+        const auto angle = (i / 256.) * 2. * std::numbers::pi;
+        const auto s = __builtin_sin(angle); // std::sin has constexpr problems
+        lut[i] = static_cast<std::uint8_t>((s * 127.5) + 127.5);
+    }
+
+    return lut;
+}
+
+/*[[gnu::section(".oc_mem.x.sin")]]*/ [[gnu::aligned(32)]] static const auto sin_lut = make_sin_lut();
+#ifdef USE_X
+[[gnu::section(".oc_mem.x.stack")]] [[gnu::aligned(4)]] static std::uint8_t xstack[4 * 1024]{};
+static const auto xstack_begin = xstack + sizeof(xstack);
+#endif
+#if MODE == MODE_LINE
+#ifdef USE_Y
+[[gnu::section(".oc_mem.y.buf")]]
+#endif
+[[gnu::aligned(32)]] static std::uint16_t linebuf[2][width]{};
+#endif
+
+#if MODE == MODE_FULL
+IL_ATTR static void update_full(std::uint16_t *buffer) {
+    #ifdef USE_DMA
+        dma_wait(DMAC_CHCR_0);
+    #endif
+    LCD_SetDrawingBounds(0, width - 1, 0, height - 1);
+    LCD_SendCommand(COMMAND_PREPARE_FOR_DRAW_DATA);
+    #ifndef USE_DMA
+    for (auto pixel = buffer; pixel < buffer + width * height; pixel++)
+        *lcd_data_port = *pixel;
+    #else
+        dmac_chcr tmp_chcr = { .raw = 0 };
+        tmp_chcr.s.TS_0 = SIZE_2_0;
+        tmp_chcr.s.TS_1 = SIZE_2_1;
+        tmp_chcr.s.DM   = DAR_FIXED_HARD;
+        tmp_chcr.s.SM   = SAR_INCREMENT;
+        tmp_chcr.s.RS   = AUTO;
+        tmp_chcr.s.TB   = CYCLE_STEAL;
+        tmp_chcr.s.RPT  = REPEAT_NORMAL;
+        tmp_chcr.s.DE   = 1;
+
+        DMAC_CHCR_0->raw = 0;
+        *DMAC_SAR_0 = reinterpret_cast<std::uintptr_t>(buffer) & 0x1FFFFFFF;
+        *DMAC_DAR_0 = reinterpret_cast<std::uintptr_t>(lcd_data_port) & 0x1FFFFFFF;
+        *DMAC_TCR_0 = width * height;
+
+        for (auto ptr = reinterpret_cast<std::uintptr_t>(buffer); ptr < reinterpret_cast<std::uintptr_t>(buffer + width * height); ptr += 32)
+            __asm__ volatile ("ocbwb @%0" : : "r"(ptr));
+
+        DMAC_CHCR_0->raw = tmp_chcr.raw;
+    #endif
+}
+
+#elif MODE == MODE_LINE
+
+IL_ATTR static void update_line(std::uint16_t *buffer, unsigned line) {
+    #ifdef USE_DMA
+        dma_wait(DMAC_CHCR_0);
+    #endif
+    LCD_SetDrawingBounds(0, width - 1, line, line);
+    LCD_SendCommand(COMMAND_PREPARE_FOR_DRAW_DATA);
+    #ifndef USE_DMA
+    for (auto pixel = buffer; pixel < buffer + width; pixel++)
+        *lcd_data_port = *pixel;
+    #else
+        dmac_chcr tmp_chcr = { .raw = 0 };
+        tmp_chcr.s.TS_0 = SIZE_2_0;
+        tmp_chcr.s.TS_1 = SIZE_2_1;
+        tmp_chcr.s.DM   = DAR_FIXED_HARD;
+        tmp_chcr.s.SM   = SAR_INCREMENT;
+        tmp_chcr.s.RS   = AUTO;
+        tmp_chcr.s.TB   = CYCLE_STEAL;
+        tmp_chcr.s.RPT  = REPEAT_NORMAL;
+        tmp_chcr.s.DE   = 1;
+
+        DMAC_CHCR_0->raw = 0;
+        *DMAC_SAR_0 = reinterpret_cast<std::uintptr_t>(buffer)
+        #ifndef USE_Y
+        & 0x1FFFFFFF
+        #endif
+        ;
+        *DMAC_DAR_0 = reinterpret_cast<std::uintptr_t>(lcd_data_port) & 0x1FFFFFFF;
+        *DMAC_TCR_0 = width;
+
+        for (auto ptr = reinterpret_cast<std::uintptr_t>(buffer); ptr < reinterpret_cast<std::uintptr_t>(buffer + width); ptr += 32)
+            __asm__ volatile ("ocbwb @%0" : : "r"(ptr));
+
+        DMAC_CHCR_0->raw = tmp_chcr.raw;
+    #endif
+}
+
+#endif
+
+#if MODE != MODE_PIXEL
+IL_ATTR static void update_bench() {
+    LCD_SetDrawingBounds(0, debug_char_width * 19 - 1, 0, debug_line_height * 3 - 1);
+    LCD_SendCommand(COMMAND_PREPARE_FOR_DRAW_DATA);
+    for (size_t line = 0; line < debug_line_height * 3; line++)
+        for(size_t off = 0; off < debug_char_width * 19; off++)
+            *lcd_data_port = vram[line * width + off];
+}
+#else
+IL_ATTR static void update_bench() {
+    LCD_SetDrawingBounds(0, debug_char_width * 19 - 1, debug_line_height * 2, debug_line_height * 3 - 1);
+    LCD_SendCommand(COMMAND_PREPARE_FOR_DRAW_DATA);
+    for (size_t line = debug_line_height * 2; line < debug_line_height * 3; line++)
+        for(size_t off = 0; off < debug_char_width * 19; off++)
+            *lcd_data_port = vram[line * width + off];
+}
+#endif
+
+IL_ATTR static void render_plasma_line(int y, uint16_t frame_phase
+#if MODE != MODE_PIXEL
+    , uint16_t *target
+#endif
+)
+{
+    // 8.8 fixed point phases
+    std::uint16_t x_phase = frame_phase;
+    std::uint16_t y_phase = (y << 4) + frame_phase;
+
+    std::uint16_t x_step = 5 << 8;      // horizontal frequency
+    std::uint16_t y_mod  = y_phase >> 8;
+
+    for (std::size_t x = 0; x < width; x++, x_phase += x_step)
+    {
+        std::uint8_t s1 = sin_lut[x_phase >> 8];
+        std::uint8_t s2 = sin_lut[y_mod];
+        std::uint8_t s3 = sin_lut[((x_phase + y_phase) >> 9) & 0xFF];
+
+        std::uint16_t sum = s1 + s2 + s3;   // 0–765
+
+        std::uint8_t v = sum >> 2;          // 0–191 approx
+
+        // RGB565 mapping (fast, no multiplies)
+        std::uint16_t r = (v & 0x1F) << 11;
+        std::uint16_t g = (v & 0x3F) << 5;
+        std::uint16_t b = (v & 0x1F);
+
+        #if MODE != MODE_PIXEL
+        target[x]
+        #else
+        *lcd_data_port
+        #endif
+         = r | g | b;
+    }
+}
+
+#if MODE == MODE_FULL
+IL_ATTR [[gnu::noinline]] static void do_bench() {
+    *TMU_TCOR_1 = -1;
+    
+    *TMU_TCNT_1 = -1;
+    TMU_TSTR->s.STR1 = 1;
+    for (std::size_t y = 0; y < height; y++)
+    {
+        render_plasma_line(y, y * 3, vram + y * width);
+    }
+    const auto after_render = *TMU_TCNT_1;
+    update_full(vram);
+    #ifdef USE_DMA
+    dma_wait(DMAC_CHCR_0);
+    #endif
+    const auto after_refresh = *TMU_TCNT_1;
+    Debug_Printf(0, 0, false, 0, "gen# %8" PRIu32 " ticks", -1u - after_render);
+    Debug_Printf(0, 1, false, 0, "ref# %8" PRIu32 " ticks", after_render - after_refresh);
+    Debug_Printf(0, 2, false, 0, "all# %8" PRIu32 " ticks", -1u - after_refresh);
+    update_bench();
+}
+#elif MODE == MODE_LINE
+IL_ATTR [[gnu::noinline]] static void do_bench() {
+    *TMU_TCOR_1 = -1;
+    
+    std::uint32_t render_ticks = 0;
+    std::uint32_t refresh_ticks = 0;
+    std::uint32_t last = -1u;
+    *TMU_TCNT_1 = last;
+    TMU_TSTR->s.STR1 = 1;
+    for (std::size_t y = 0; y < height; y++)
+    {
+        render_plasma_line(y, y * 3, linebuf[y % 2]);
+        {
+            const auto current = *TMU_TCNT_1;
+            render_ticks += last - current;
+            last = current;
+        }
+        update_line(linebuf[y % 2], y);
+        {
+            const auto current = *TMU_TCNT_1;
+            refresh_ticks += last - current;
+            last = current;
+        }
+    }
+    #ifdef USE_DMA
+    dma_wait(DMAC_CHCR_0);
+    refresh_ticks += last - *TMU_TCNT_1;
+    #endif
+    Debug_Printf(0, 0, false, 0, "gen# %8" PRIu32 " ticks", render_ticks);
+    Debug_Printf(0, 1, false, 0, "ref# %8" PRIu32 " ticks", refresh_ticks);
+    Debug_Printf(0, 2, false, 0, "all# %8" PRIu32 " ticks", render_ticks + refresh_ticks);
+    update_bench();
+}
+#elif MODE == MODE_PIXEL
+IL_ATTR [[gnu::noinline]] static void do_bench() {
+    *TMU_TCOR_1 = -1;
+    
+    *TMU_TCNT_1 = -1;
+    TMU_TSTR->s.STR1 = 1;
+    LCD_SetDrawingBounds(0, width - 1, 0, height - 1);
+    LCD_SendCommand(COMMAND_PREPARE_FOR_DRAW_DATA);
+    for (std::size_t y = 0; y < height; y++)
+    {
+        render_plasma_line(y, y * 3);
+    }
+    const auto after = *TMU_TCNT_1;
+    Debug_Printf(0, 2, false, 0, "all# %8" PRIu32 " ticks", -1u - after);
+    update_bench();
+}
+#else
+#error "Unknown Mode"
+#endif
+
+int main() {
+    POWER_MSTPCR0->s.TMU = 0;
+    TMU_TCR_1->raw = 0;
+    TMU_TCR_1->s.TPSC = PHI_DIV_4;
+    #ifdef USE_DMA
+    POWER_MSTPCR0->s.DMAC = 0;
+    DMAC_DMAOR->raw = 0;
+    DMAC_DMAOR->s.DME = 1;
+    #endif
+    on_alt_stack(xstack_begin, do_bench);
+    #ifdef USE_DMA
+    DMAC_DMAOR->raw = 0;
+    POWER_MSTPCR0->s.DMAC = 1;
+    #endif
+    POWER_MSTPCR0->s.TMU = 1;
+    Debug_WaitKey();
+    return 0;
 }
