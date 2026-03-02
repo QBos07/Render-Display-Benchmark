@@ -20,7 +20,7 @@
 #define USE_X
 #define USE_Y
 #define USE_DMA
-
+#define USE_UP
 
 #if MODE == MODE_FULL
 #define MS "F"
@@ -37,11 +37,11 @@
 #define DMAS
 #endif
 
-#if MODE != MODE_LINE && defined(USE_Y)
-#error "USE_Y needs MODE_LINE"
+#if MODE != MODE_LINE && defined(USE_Y) && !(MODE == MODE_PIXEL && defined(USE_UP))
+#error "USE_Y needs MODE_LINE or MODE_PIXEL with USE_UP"
 #endif
-#if MODE == MODE_PIXEL && defined(USE_DMA)
-#error "USE_DMA doesnt work with MODE_PIXEL"
+#if MODE == MODE_PIXEL && defined(USE_DMA) && !defined(USE_UP)
+#error "USE_DMA doesnt work with MODE_PIXEL without USE_UP"
 #endif
 
 #define TO_STRING(x) #x
@@ -69,7 +69,25 @@ extern "C" void on_alt_stack(void *, void (*)());
 #define YS
 #endif
 
-APP_NAME("Bencher " MS ILS XS YS DMAS)
+#ifdef USE_UP
+#define UP_MUL(x) ((x) * 2)
+#define UP_DIV(x) ((x) / 2)
+#define UPS "-UP"
+#else
+#define UP_MUL
+#define UP_DIV
+#define UPS
+#endif
+
+#if defined(USE_UP) && defined(USE_DMA)
+#define UP_DMA_MUL(x) ((x) * 2)
+#define UP_DMA_DIV(x) ((x) / 2)
+#else
+#define UP_DMA_MUL
+#define UP_DMA_DIV
+#endif
+
+APP_NAME("Bencher " MS ILS XS YS DMAS UPS)
 APP_AUTHOR("QBos07")
 APP_DESCRIPTION("Benchmarks various display and rendering aspects")
 APP_VERSION("1.0.0 " __TIMESTAMP__)
@@ -93,11 +111,11 @@ constexpr std::array<uint8_t, 256> make_sin_lut()
 [[gnu::section(".oc_mem.x.stack")]] [[gnu::aligned(4)]] static std::uint8_t xstack[4 * 1024]{};
 static const auto xstack_begin = xstack + sizeof(xstack);
 #endif
-#if MODE == MODE_LINE
+#if MODE == MODE_LINE || (defined(USE_UP) && MODE == MODE_PIXEL)
 #ifdef USE_Y
 [[gnu::section(".oc_mem.y.buf")]]
 #endif
-[[gnu::aligned(32)]] static std::uint16_t linebuf[2][width]{};
+[[gnu::aligned(32)]] static std::uint16_t linebuf[2][UP_DIV(UP_DMA_MUL(width))]{};
 #endif
 
 #if MODE == MODE_FULL
@@ -108,8 +126,22 @@ IL_ATTR static void update_full(std::uint16_t *buffer) {
     LCD_SetDrawingBounds(0, width - 1, 0, height - 1);
     LCD_SendCommand(COMMAND_PREPARE_FOR_DRAW_DATA);
     #ifndef USE_DMA
+    #ifndef USE_UP
     for (auto pixel = buffer; pixel < buffer + width * height; pixel++)
         *lcd_data_port = *pixel;
+    #else
+    for (auto line = buffer; line < buffer + (height / 2) * (width / 2); line += width / 2)
+    {
+        for (auto pixel = line; pixel < line + width / 2; pixel++) {
+            *lcd_data_port = *pixel;
+            *lcd_data_port = *pixel;
+        }
+        for (auto pixel = line; pixel < line + width / 2; pixel++) {
+            *lcd_data_port = *pixel;
+            *lcd_data_port = *pixel;
+        }
+    }
+    #endif
     #else
         dmac_chcr tmp_chcr = { .raw = 0 };
         tmp_chcr.s.TS_0 = SIZE_2_0;
@@ -139,11 +171,26 @@ IL_ATTR static void update_line(std::uint16_t *buffer, unsigned line) {
     #ifdef USE_DMA
         dma_wait(DMAC_CHCR_0);
     #endif
-    LCD_SetDrawingBounds(0, width - 1, line, line);
+    LCD_SetDrawingBounds(0, width - 1, line, line
+    #ifdef USE_UP
+    + 1
+    #endif
+    );
     LCD_SendCommand(COMMAND_PREPARE_FOR_DRAW_DATA);
     #ifndef USE_DMA
+    #ifndef USE_UP
     for (auto pixel = buffer; pixel < buffer + width; pixel++)
         *lcd_data_port = *pixel;
+    #else
+    for (auto pixel = buffer; pixel < buffer + width / 2; pixel++) {
+        *lcd_data_port = *pixel;
+        *lcd_data_port = *pixel;
+    }
+    for (auto pixel = buffer; pixel < buffer + width / 2; pixel++) {
+        *lcd_data_port = *pixel;
+        *lcd_data_port = *pixel;
+    }
+    #endif
     #else
         dmac_chcr tmp_chcr = { .raw = 0 };
         tmp_chcr.s.TS_0 = SIZE_2_0;
@@ -152,7 +199,11 @@ IL_ATTR static void update_line(std::uint16_t *buffer, unsigned line) {
         tmp_chcr.s.SM   = SAR_INCREMENT;
         tmp_chcr.s.RS   = AUTO;
         tmp_chcr.s.TB   = CYCLE_STEAL;
+        #ifndef USE_UP
         tmp_chcr.s.RPT  = REPEAT_NORMAL;
+        #else
+        tmp_chcr.s.RPT  = RELOAD_SAR_TCR;
+        #endif
         tmp_chcr.s.DE   = 1;
 
         DMAC_CHCR_0->raw = 0;
@@ -162,7 +213,10 @@ IL_ATTR static void update_line(std::uint16_t *buffer, unsigned line) {
         #endif
         ;
         *DMAC_DAR_0 = reinterpret_cast<std::uintptr_t>(lcd_data_port) & 0x1FFFFFFF;
-        *DMAC_TCR_0 = width;
+        *DMAC_TCR_0 = UP_MUL(width);
+        #ifdef USE_UP
+        *DMAC_TCRB_0 = width << 16 | width;
+        #endif
 
         for (auto ptr = reinterpret_cast<std::uintptr_t>(buffer); ptr < reinterpret_cast<std::uintptr_t>(buffer + width); ptr += 32)
             __asm__ volatile ("ocbwb @%0" : : "r"(ptr));
@@ -192,7 +246,7 @@ IL_ATTR static void update_bench() {
 #endif
 
 IL_ATTR static void render_plasma_line(int y, uint16_t frame_phase
-#if MODE != MODE_PIXEL
+#if MODE != MODE_PIXEL || defined(USE_UP)
     , uint16_t *target
 #endif
 )
@@ -201,10 +255,10 @@ IL_ATTR static void render_plasma_line(int y, uint16_t frame_phase
     std::uint16_t x_phase = frame_phase;
     std::uint16_t y_phase = (y << 4) + frame_phase;
 
-    std::uint16_t x_step = 5 << 8;      // horizontal frequency
+    std::uint16_t x_step = UP_MUL(5 << 8);      // horizontal frequency
     std::uint16_t y_mod  = y_phase >> 8;
 
-    for (std::size_t x = 0; x < width; x++, x_phase += x_step)
+    for (std::size_t x = 0; x < UP_DIV(UP_DMA_MUL(width)); x += UP_DMA_MUL(1), x_phase += x_step)
     {
         std::uint8_t s1 = sin_lut[x_phase >> 8];
         std::uint8_t s2 = sin_lut[y_mod];
@@ -219,14 +273,91 @@ IL_ATTR static void render_plasma_line(int y, uint16_t frame_phase
         std::uint16_t g = (v & 0x3F) << 5;
         std::uint16_t b = (v & 0x1F);
 
+        std::uint16_t pixel = r | g | b;
         #if MODE != MODE_PIXEL
-        target[x]
+        target[x] = pixel;
         #else
-        *lcd_data_port
+        *lcd_data_port = pixel;
         #endif
-         = r | g | b;
+        #ifdef USE_UP
+        #if MODE == MODE_PIXEL
+        *lcd_data_port = pixel;
+        target[x] = pixel;
+        #endif
+        #ifdef USE_DMA
+        target[x + 1] = pixel;
+        #endif
+        #endif
     }
 }
+
+#if MODE == MODE_FULL && defined(USE_DMA) && defined(USE_UP)
+IL_ATTR void dmac_copy(std::size_t y) {
+    const auto channel = (y / 2) % 2;
+    const auto chcr = channel ? DMAC_CHCR_1 : DMAC_CHCR_0;
+    const auto tcr = channel ? DMAC_TCR_1 : DMAC_TCR_0;
+    const auto sar = channel ? DMAC_SAR_1 : DMAC_SAR_0;
+    const auto dar = channel ? DMAC_DAR_1 : DMAC_DAR_0;
+
+    dma_wait(chcr);
+    
+    dmac_chcr tmp_chcr = { .raw = 0 };
+    tmp_chcr.s.TS_0 = SIZE_2_0;
+    tmp_chcr.s.TS_1 = SIZE_2_1;
+    tmp_chcr.s.DM   = DAR_INCREMENT;
+    tmp_chcr.s.SM   = SAR_INCREMENT;
+    tmp_chcr.s.RS   = AUTO;
+    tmp_chcr.s.TB   = CYCLE_STEAL;
+    tmp_chcr.s.RPT  = REPEAT_NORMAL;
+    tmp_chcr.s.DE   = 1;
+
+    chcr->raw = 0;
+    *sar = reinterpret_cast<std::uintptr_t>(vram + y * width) & 0x1FFFFFFF;
+    *dar = reinterpret_cast<std::uintptr_t>(vram + (y + 1) * width) & 0x1FFFFFFF;
+    *tcr = width;
+
+    for (auto ptr = reinterpret_cast<std::uintptr_t>(vram + y * width); ptr < reinterpret_cast<std::uintptr_t>(vram + (y + 1) * width); ptr += 32)
+        __asm__ volatile ("ocbwb @%0" : : "r"(ptr));
+
+    chcr->raw = tmp_chcr.raw;
+}
+#endif
+
+#if MODE == MODE_PIXEL && defined(USE_UP)
+IL_ATTR void send_line(std::uint16_t *buffer) {
+    #ifndef USE_DMA
+        for (auto pixel = buffer; pixel < buffer + width / 2; pixel++) {
+            *lcd_data_port = *pixel;
+            *lcd_data_port = *pixel;
+        }
+    #else
+        dmac_chcr tmp_chcr = { .raw = 0 };
+        tmp_chcr.s.TS_0 = SIZE_2_0;
+        tmp_chcr.s.TS_1 = SIZE_2_1;
+        tmp_chcr.s.DM   = DAR_FIXED_HARD;
+        tmp_chcr.s.SM   = SAR_INCREMENT;
+        tmp_chcr.s.RS   = AUTO;
+        tmp_chcr.s.TB   = CYCLE_STEAL;
+        tmp_chcr.s.RPT  = REPEAT_NORMAL;
+        tmp_chcr.s.DE   = 1;
+
+        DMAC_CHCR_0->raw = 0;
+        *DMAC_SAR_0 = reinterpret_cast<std::uintptr_t>(buffer)
+        #ifndef USE_Y
+        & 0x1FFFFFFF
+        #endif
+        ;
+        *DMAC_DAR_0 = reinterpret_cast<std::uintptr_t>(lcd_data_port) & 0x1FFFFFFF;
+        *DMAC_TCR_0 = width;
+
+        for (auto ptr = reinterpret_cast<std::uintptr_t>(buffer); ptr < reinterpret_cast<std::uintptr_t>(buffer + width); ptr += 32)
+            __asm__ volatile ("ocbwb @%0" : : "r"(ptr));
+
+        DMAC_CHCR_0->raw = tmp_chcr.raw;
+        dma_wait(DMAC_CHCR_0);
+    #endif
+}
+#endif
 
 #if MODE == MODE_FULL
 IL_ATTR [[gnu::noinline]] static void do_bench() {
@@ -234,10 +365,16 @@ IL_ATTR [[gnu::noinline]] static void do_bench() {
     
     *TMU_TCNT_1 = -1;
     TMU_TSTR->s.STR1 = 1;
-    for (std::size_t y = 0; y < height; y++)
+    for (std::size_t y = 0; y < height; y += UP_MUL(1))
     {
-        render_plasma_line(y, y * 3, vram + y * width);
+        render_plasma_line(y, y * 3, vram + UP_DIV(UP_DMA_MUL(y)) * UP_DIV(UP_DMA_MUL(width)));
+        #if defined(USE_UP) && defined(USE_DMA)
+        dmac_copy(y);
+        #endif
     }
+    #if defined(USE_UP) && defined(USE_DMA)
+    dma_wait(DMAC_CHCR_1);
+    #endif
     const auto after_render = *TMU_TCNT_1;
     update_full(vram);
     #ifdef USE_DMA
@@ -258,15 +395,15 @@ IL_ATTR [[gnu::noinline]] static void do_bench() {
     std::uint32_t last = -1u;
     *TMU_TCNT_1 = last;
     TMU_TSTR->s.STR1 = 1;
-    for (std::size_t y = 0; y < height; y++)
+    for (std::size_t y = 0; y < height; y += UP_MUL(1))
     {
-        render_plasma_line(y, y * 3, linebuf[y % 2]);
+        render_plasma_line(y, y * 3, linebuf[UP_DIV(y) % 2]);
         {
             const auto current = *TMU_TCNT_1;
             render_ticks += last - current;
             last = current;
         }
-        update_line(linebuf[y % 2], y);
+        update_line(linebuf[UP_DIV(y) % 2], y);
         {
             const auto current = *TMU_TCNT_1;
             refresh_ticks += last - current;
@@ -290,9 +427,14 @@ IL_ATTR [[gnu::noinline]] static void do_bench() {
     TMU_TSTR->s.STR1 = 1;
     LCD_SetDrawingBounds(0, width - 1, 0, height - 1);
     LCD_SendCommand(COMMAND_PREPARE_FOR_DRAW_DATA);
-    for (std::size_t y = 0; y < height; y++)
+    for (std::size_t y = 0; y < height; y += UP_MUL(1))
     {
+        #ifndef USE_UP
         render_plasma_line(y, y * 3);
+        #else
+        render_plasma_line(y, y*3, linebuf[(y / 2) % 2]);
+        send_line(linebuf[(y / 2) % 2]);
+        #endif
     }
     const auto after = *TMU_TCNT_1;
     Debug_Printf(0, 2, false, 0, "all# %8" PRIu32 " ticks", -1u - after);
